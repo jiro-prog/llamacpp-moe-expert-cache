@@ -1,0 +1,19 @@
+# secrets and local state
+api-key.txt
+*.log
+logs/
+
+# generated
+*.exe
+*.csv
+*.jsonl
+bench/*-trace.txt
+bench/*-status.txt
+__pycache__/
+*.pyc
+
+# models and downloads
+*.gguf
+*.bin
+*.index
+*.zip

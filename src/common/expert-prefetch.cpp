@@ -1,0 +1,1408 @@
+#include "expert-prefetch.h"
+
+#include "ggml.h"
+#include "ggml-backend.h"
+#include "ggml-cpu.h"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdarg>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <deque>
+#include <list>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <vector>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <winioctl.h>
+#include <psapi.h>
+#endif
+
+namespace {
+
+enum job_kind { JOB_PREFETCH, JOB_EVICT, JOB_READ };
+
+struct job {
+    job_kind kind;
+    char *   p;
+    size_t   n;
+    int      layer;   // prefetch jobs: the layer they belong to (for the timing of when a layer's slices are all in)
+    int64_t  t_push;  // when it was queued (diagnostics)
+    int64_t  foff;    // JOB_READ: offset in the expert file
+    int32_t  rd;      // JOB_READ: index into the cache's ready flags (unit*3 + kind)
+};
+
+constexpr int MAX_LAYERS = 512;
+
+// the routed-expert weights of one layer, as the MUL_MAT_ID nodes use them: gate (or fused gate_up), up, down
+struct layer_weights {
+    ggml_tensor * w[3] = { nullptr, nullptr, nullptr };
+};
+
+// Expert cache (LLAMA_EXPERT_CACHE_GB > 0, LLAMA_EXPERT_CACHE_FILE = prefix of tools\densecopy output).
+// Decode reads its experts from a cache in locked private memory instead of the memory-mapped GGUF: a miss is one
+// unbuffered ReadFile per slice (gate/up/down, 0.9-1.7 MB) from a copy of the experts that is never mapped (non-buffered
+// reads of a mapped file go one at a time), a hit costs nothing. With the mapped file every page outside the working set
+// was a page fault (about 90k per token, 2-5 us each) and the misses were read in 300 KB pieces (2026-10-05 diag).
+// MUL_MAT_ID gets the slice addresses through ggml_cpu_set_expert_data_fn (a local change in ggml-cpu); a compute
+// thread that needs a slice still being read waits for it. One LRU per unit size (one unit = a layer's expert).
+// Prompts of 32+ tokens go to the GPU (op offload) and still read the mapped file.
+struct ec_layer {
+    int64_t base = 0;              // offset of expert 0 in the file
+    int64_t unit = 0;              // bytes per expert (gate + up + down)
+    int64_t sz[3]  = { 0, 0, 0 };  // slice bytes
+    int64_t off[3] = { 0, 0, 0 };  // slice offset within a unit
+    int     cls = -1;
+};
+
+struct ec_class {
+    int64_t                                slot_size = 0;
+    int                                    n_slots   = 0;
+    int                                    n_layers  = 0;
+    char *                                 mem       = nullptr;
+    std::vector<int32_t>                   owner;   // unit in the slot, -1 = free
+    std::list<int32_t>                     lru;     // slots, most recently used first
+    std::vector<std::list<int32_t>::iterator> pos;
+};
+
+struct ec_cache {
+    bool                    on = false;
+    bool                    failed = false;
+    double                  gb = 0;
+    double                  mmap_gb = 2;
+    bool                    reorder = true;   // LLAMA_EXPERT_CACHE_REORDER: MUL_MAT_ID does the cached experts first
+    std::string             prefix;
+    int                     n_expert = 0;
+    std::vector<ec_layer>   L;
+    std::vector<ec_class>   cls;
+    std::vector<int32_t>    slot;    // per unit (layer*n_expert + e): slot in its class, -1 = not cached
+    std::unique_ptr<std::atomic<uint8_t>[]> ready;   // per unit*3 + kind: 0 not cached, 1 being read, 2 ready
+    std::unordered_map<const ggml_tensor *, int> tkey;   // weight -> layer*3 + kind
+    std::vector<uint8_t>    spec;    // per unit: read ahead on a prediction and not used yet
+    int                     max_unique = 0;   // larger batches use the mapped file (prefetch path)
+    // statistics, per pass
+    std::atomic<int64_t>    n_hit{0}, n_miss{0}, n_wait{0}, ns_wait{0}, n_read{0}, bytes_read{0}, ns_read{0}, n_fail{0};
+};
+
+struct state {
+    int    n_workers = 6;
+    size_t chunk     = 2u << 20;
+    bool   touch     = true;
+    int    evict     = 2;
+    bool   stats     = false;
+
+    std::mutex              mu;
+    std::condition_variable cv;
+    std::deque<job>         hi;   // prefetch jobs of the layer being computed
+    std::deque<job>         lo;   // evictions
+    std::vector<std::thread> threads;
+
+    std::vector<layer_weights>      layers;
+    std::vector<std::vector<job>>   used;     // per layer: the slices prefetched last time (evicted later)
+    std::vector<int32_t>            ids;
+    std::vector<uint8_t>            seen;
+
+    // statistics
+    std::atomic<int64_t> bytes_prefetched{0};
+    std::atomic<int64_t> ns_prefetch{0};
+    std::atomic<int64_t> ns_touch{0};
+    int64_t              n_topk     = 0;
+    int64_t              n_unique   = 0;
+    int64_t              n_rows     = 0;
+    std::chrono::steady_clock::time_point t_last = std::chrono::steady_clock::now();
+
+    // timing (LLAMA_EXPERT_PREFETCH_TIMING=1): per layer, when routing was known, when its slices were all in,
+    // when the MoE output was ready
+    bool                 timing = false;
+    std::atomic<int>     pending[MAX_LAYERS];
+    std::atomic<int64_t> t_done[MAX_LAYERS];
+    int64_t              t_topk[MAX_LAYERS] = {};
+    int64_t              t_moe[MAX_LAYERS]  = {};
+    int64_t              t_pass_end = 0, t_pass_end_prev = 0;   // last layer's MoE output (this pass, the one before)
+    int64_t              t_graph_start = 0;                     // first node asked about after the last pass
+    bool                 want_start = true;
+    int64_t              t_out = 0;   // "result_output" computed (LLAMA_EXPERT_PREFETCH_OUTTIME=1: observed, one more sync per pass)
+    bool                 out_time = false;
+
+    // diagnostics (LLAMA_EXPERT_PREFETCH_DIAG=1): where the fetch time goes. Each prefetch job asks which of its
+    // pages are in the working set (QueryWorkingSetEx) before and after PrefetchVirtualMemory; the touch time of
+    // jobs with pages outside it is the cost of faulting them in. Per pass: the disk counters of PhysicalDrive0
+    // (IOCTL_DISK_PERFORMANCE, no admin needed), the process's page faults and CPU times.
+    bool                 diag = false;
+    std::atomic<int64_t> pg_total{0};
+    std::atomic<int64_t> pg_ws0{0};        // in the working set before the prefetch
+    std::atomic<int64_t> pg_ws1{0};        // ... after it
+    std::atomic<int64_t> pg_cold{0};       // outside it after the prefetch, in jobs that had such pages
+    std::atomic<int64_t> ns_query{0};
+    std::atomic<int64_t> ns_touch_cold{0}; // touch time of jobs with pages outside the working set
+    std::atomic<int64_t> ns_touch_warm{0}; // ... of jobs that were all in
+    std::atomic<int64_t> ns_pf_cold{0};    // prefetch time of the same two kinds of jobs
+    std::atomic<int64_t> ns_pf_warm{0};
+    std::atomic<int64_t> n_job_cold{0};
+    std::atomic<int64_t> n_job_warm{0};
+    std::atomic<int64_t> ns_wait{0};       // queue wait of prefetch jobs (queued -> picked up)
+    std::atomic<int>     busy{0};          // workers inside a prefetch job now
+    std::atomic<int>     busy_max{0};
+#ifdef _WIN32
+    HANDLE           disk = INVALID_HANDLE_VALUE;
+    DISK_PERFORMANCE dp_last{};
+    uint64_t         k_last = 0, u_last = 0;
+    DWORD            faults_last = 0;
+#endif
+
+    FILE *  trace  = nullptr;   // LLAMA_EXPERT_PREFETCH_TRACE=<file>: the experts every layer selected
+    int64_t n_pass = 0;
+
+    // GPU keep-alive (LLAMA_GPU_KEEPALIVE=<spin us>): during decode the GPU only gets short bursts of work, so the
+    // driver drops it to P5 (memory clock 810 instead of 6800 MHz; seen 2026-10-05: the GPU part of a pass
+    // 0.03 -> 0.14 s for about half of the passes). Kernels of two streams do not overlap here (WDDM: a 10 us kernel
+    // waits behind the other stream's queue), so a thread spins one warp only while the GPU has nothing else to do:
+    // from a layer's routing result until its MoE output (the CPU computes the experts then), one short kernel at a
+    // time, so the next layer's GPU work waits at most one spin. That keeps the utilization (and the P-state) up.
+    int                     ka_spin_us = 0;
+    std::atomic<int>        ka_window{0};   // 1 = the CPU is computing a layer's experts
+    std::mutex              ka_mu;
+    std::condition_variable ka_cv;
+    std::once_flag          ka_once;
+    std::atomic<int64_t>    ka_kernels{0};
+
+    ec_cache ec;
+
+    // next-layer prediction (LLAMA_EXPERT_PREDICT=<k>; the graph then has "ffn_moe_pred-N" = layer N+1's router logits
+    // on layer N's FFN input). At layer N's routing result the k best predicted experts of layer N+1 that are not
+    // cached are read ahead at low priority, while the disk would otherwise wait for the compute and the GPU.
+    // A prediction that turns out wrong was put at the cold end of the LRU and goes first. k = 0: statistics only.
+    bool                              pred_on = false;
+    int                               pred_k  = 0;
+    ggml_tensor *                     pred_t[MAX_LAYERS] = {};   // this graph's prediction node per layer (ask phase)
+    std::vector<float>                pred_buf;
+    std::vector<std::vector<int32_t>> pred_rank;   // per layer: its experts in predicted order (top 32), made one layer before
+    std::deque<job>                   mid;         // read-ahead jobs (after the current layer's reads, before evictions)
+    int                               mid_active = 0;   // workers on a read-ahead job (under mu)
+    int                               mid_max    = 3;   // LLAMA_EXPERT_PREDICT_WORKERS
+    int64_t pr_layers = 0, pr_n = 0, pr_hit[4] = {}, pr_miss = 0, pr_cov[4] = {}, pr_spec = 0, pr_spec_used = 0, pr_drop = 0, pr_ns = 0;
+
+    state() {
+        for (int i = 0; i < MAX_LAYERS; ++i) {
+            pending[i] = 0;
+            t_done[i]  = 0;
+        }
+    }
+};
+
+int env_int(const char * name, int def) {
+    const char * v = std::getenv(name);
+    return v && *v ? std::atoi(v) : def;
+}
+
+int64_t now_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// Per-pass lines go to a buffer that a thread writes out once a second: a write to the redirected stderr costs
+// milliseconds (2026-10-05: printing the -Stats lines directly cost ~25% of the decode speed)
+std::mutex       g_log_mu;
+std::string      g_log_buf;
+std::once_flag   g_log_once;
+
+void log_writer() {
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        std::string b;
+        {
+            std::lock_guard<std::mutex> lock(g_log_mu);
+            b.swap(g_log_buf);
+        }
+        if (!b.empty()) {
+            std::fwrite(b.data(), 1, b.size(), stderr);
+            std::fflush(stderr);
+        }
+    }
+}
+
+void plog(const char * fmt, ...) {
+    char    buf[2048];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    std::call_once(g_log_once, [] { std::thread(log_writer).detach(); });
+    std::lock_guard<std::mutex> lock(g_log_mu);
+    g_log_buf += buf;
+}
+
+#ifdef _WIN32
+// pages of [p, p + n) that are in this process's working set (-1 if the query fails)
+int64_t pages_in_ws(const char * p, size_t n, int64_t & n_pages) {
+    typedef BOOL (WINAPI * fn_t)(HANDLE, PVOID, DWORD);
+    static fn_t fn = (fn_t) (void *) GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "K32QueryWorkingSetEx");
+    thread_local std::vector<PSAPI_WORKING_SET_EX_INFORMATION> v;
+    const uintptr_t b = (uintptr_t) p & ~(uintptr_t) 4095;
+    const uintptr_t e = (uintptr_t) p + n;
+    n_pages = (int64_t) ((e - b + 4095) / 4096);
+    if (!fn) {
+        return -1;
+    }
+    v.resize((size_t) n_pages);
+    for (int64_t i = 0; i < n_pages; ++i) {
+        v[i].VirtualAddress = (void *) (b + (uintptr_t) i * 4096);
+    }
+    if (!fn(GetCurrentProcess(), v.data(), (DWORD) (v.size() * sizeof(v[0])))) {
+        return -1;
+    }
+    int64_t c = 0;
+    for (const auto & x : v) {
+        c += x.VirtualAttributes.Valid;
+    }
+    return c;
+}
+
+uint64_t ft_u64(const FILETIME & f) { return ((uint64_t) f.dwHighDateTime << 32) | f.dwLowDateTime; }
+
+DWORD page_faults() {
+    typedef BOOL (WINAPI * fn_t)(HANDLE, PPROCESS_MEMORY_COUNTERS, DWORD);
+    static fn_t fn = (fn_t) (void *) GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "K32GetProcessMemoryInfo");
+    PROCESS_MEMORY_COUNTERS c{};
+    c.cb = sizeof(c);
+    return fn && fn(GetCurrentProcess(), &c, sizeof(c)) ? c.PageFaultCount : 0;
+}
+#endif
+
+// "<prefix>17" exactly (derived views such as "ffn_moe_topk-17 (reshaped)" share the prefix)
+bool parse_named(const char * name, const char * prefix, int & il) {
+    const size_t np = std::strlen(prefix);
+    if (std::strncmp(name, prefix, np) != 0) {
+        return false;
+    }
+    const char * s = name + np;
+    if (!*s) {
+        return false;
+    }
+    int v = 0;
+    for (; *s; ++s) {
+        if (*s < '0' || *s > '9') {
+            return false;
+        }
+        v = v * 10 + (*s - '0');
+    }
+    il = v;
+    return true;
+}
+
+bool parse_topk(const char * name, int & il)    { return parse_named(name, "ffn_moe_topk-", il) && il < MAX_LAYERS; }
+bool parse_moe_out(const char * name, int & il) { return parse_named(name, "ffn_moe_out-", il) && il < MAX_LAYERS; }
+
+// "blk.17.ffn_down_exps.weight" -> layer 17, slot 2
+bool parse_weight(const char * name, int & il, int & slot) {
+    if (std::strncmp(name, "blk.", 4) != 0) {
+        return false;
+    }
+    char * end = nullptr;
+    const long v = std::strtol(name + 4, &end, 10);
+    if (end == name + 4 || *end != '.') {
+        return false;
+    }
+    const char * rest = end + 1;
+    if (std::strncmp(rest, "ffn_gate_up_exps", 16) == 0 || std::strncmp(rest, "ffn_gate_exps", 13) == 0) {
+        slot = 0;
+    } else if (std::strncmp(rest, "ffn_up_exps", 11) == 0) {
+        slot = 1;
+    } else if (std::strncmp(rest, "ffn_down_exps", 13) == 0) {
+        slot = 2;
+    } else {
+        return false;
+    }
+    il = (int) v;
+    return true;
+}
+
+#ifdef _WIN32
+// WaitOnAddress / WakeByAddressAll (Windows 8+), looked up at run time (no import library needed)
+typedef BOOL (WINAPI * wait_on_address_t)(volatile VOID *, PVOID, SIZE_T, DWORD);
+typedef VOID (WINAPI * wake_by_address_t)(PVOID);
+wait_on_address_t p_wait_on_address = nullptr;
+wake_by_address_t p_wake_by_address = nullptr;
+
+void ec_load_sync_api() {
+    HMODULE h = LoadLibraryW(L"api-ms-win-core-synch-l1-2-0.dll");
+    if (h) {
+        p_wait_on_address = (wait_on_address_t) (void *) GetProcAddress(h, "WaitOnAddress");
+        p_wake_by_address = (wake_by_address_t) (void *) GetProcAddress(h, "WakeByAddressAll");
+    }
+}
+
+// one unbuffered read into the cache (each worker has its own handle: synchronous I/O on a shared handle is serialized)
+void ec_read(state * s, const job & j) {
+    ec_cache & ec = s->ec;
+    thread_local HANDLE h = INVALID_HANDLE_VALUE;
+    if (h == INVALID_HANDLE_VALUE) {
+        const std::string path = ec.prefix + ".bin";
+        h = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                        FILE_FLAG_NO_BUFFERING, nullptr);
+    }
+    const int64_t t0 = now_ns();
+    bool ok = false;
+    if (h != INVALID_HANDLE_VALUE) {
+        OVERLAPPED ov{};
+        ov.Offset     = (DWORD) (j.foff & 0xFFFFFFFF);
+        ov.OffsetHigh = (DWORD) (j.foff >> 32);
+        DWORD got = 0;
+        ok = ReadFile(h, j.p, (DWORD) j.n, &got, &ov) && got == (DWORD) j.n;
+    }
+    const int64_t t1 = now_ns();
+    ec.ns_read += t1 - t0;
+    ec.n_read++;
+    ec.bytes_read += (int64_t) j.n;
+    if (!ok) {
+        // the compute threads fall back to the mapped file for this slice
+        if (ec.n_fail++ < 5) {
+            std::fprintf(stderr, "expert-cache: read of %zu bytes at %lld failed (%lu)\n", j.n, (long long) j.foff, GetLastError());
+        }
+    }
+    ec.ready[j.rd].store(ok ? 2 : 0, std::memory_order_release);
+    if (p_wake_by_address) {
+        p_wake_by_address((PVOID) &ec.ready[j.rd]);
+    }
+    if (j.layer >= 0 && j.layer < MAX_LAYERS && --s->pending[j.layer] == 0) {
+        s->t_done[j.layer] = t1;
+    }
+}
+#endif
+
+void worker(state * s) {
+    for (;;) {
+        job  j;
+        bool is_mid = false;
+        {
+            std::unique_lock<std::mutex> lock(s->mu);
+            // read-ahead jobs use at most mid_max workers, so the others are free for the next layer's reads
+            s->cv.wait(lock, [s] { return !s->hi.empty() || (!s->mid.empty() && s->mid_active < s->mid_max) || !s->lo.empty(); });
+            if (!s->hi.empty()) {
+                j = s->hi.front();
+                s->hi.pop_front();
+            } else if (!s->mid.empty() && s->mid_active < s->mid_max) {
+                j = s->mid.front();
+                s->mid.pop_front();
+                s->mid_active++;
+                is_mid = true;
+            } else {
+                j = s->lo.front();
+                s->lo.pop_front();
+            }
+        }
+#ifdef _WIN32
+        if (j.kind == JOB_READ) {
+            ec_read(s, j);
+            if (is_mid) {
+                {
+                    std::lock_guard<std::mutex> lock(s->mu);
+                    s->mid_active--;
+                }
+                s->cv.notify_all();
+            }
+        } else if (j.kind == JOB_PREFETCH) {
+            int64_t n_pages = 0, ws0 = 0, ws1 = 0, ns_q = 0;
+            if (s->diag) {
+                const int64_t tq = now_ns();
+                s->ns_wait += tq - j.t_push;   // (prefetch jobs only)
+                const int b = ++s->busy;
+                int m = s->busy_max.load();
+                while (b > m && !s->busy_max.compare_exchange_weak(m, b)) {}
+                ws0 = pages_in_ws(j.p, j.n, n_pages);
+                ns_q += now_ns() - tq;
+            }
+            const int64_t t0 = now_ns();
+            WIN32_MEMORY_RANGE_ENTRY e;
+            e.VirtualAddress = j.p;
+            e.NumberOfBytes  = j.n;
+            PrefetchVirtualMemory(GetCurrentProcess(), 1, &e, 0);
+            const int64_t t1 = now_ns();
+            if (s->diag) {
+                ws1 = pages_in_ws(j.p, j.n, n_pages);
+                ns_q += now_ns() - t1;
+            }
+            const int64_t t1b = now_ns();
+            if (s->touch) {
+                // fault the pages into the working set here, not on the compute threads
+                volatile char sink = 0;
+                const uintptr_t first = ((uintptr_t) j.p + 4095) & ~(uintptr_t) 4095;
+                sink = sink + j.p[0];
+                for (uintptr_t a = first; a < (uintptr_t) j.p + j.n; a += 4096) {
+                    sink = sink + *(const char *) a;
+                }
+                (void) sink;
+            }
+            const int64_t t2 = now_ns();
+            s->ns_prefetch += t1 - t0;
+            s->ns_touch    += t2 - t1b;
+            s->bytes_prefetched += (int64_t) j.n;
+            if (s->diag) {
+                s->pg_total += n_pages;
+                s->pg_ws0   += ws0;
+                s->pg_ws1   += ws1;
+                s->ns_query += ns_q;
+                if (ws0 < n_pages || ws1 < n_pages) {
+                    s->pg_cold       += n_pages - ws1;
+                    s->ns_pf_cold    += t1 - t0;
+                    s->ns_touch_cold += t2 - t1b;
+                    s->n_job_cold++;
+                } else {
+                    s->ns_pf_warm    += t1 - t0;
+                    s->ns_touch_warm += t2 - t1b;
+                    s->n_job_warm++;
+                }
+                --s->busy;
+            }
+            if (j.layer >= 0 && j.layer < MAX_LAYERS && --s->pending[j.layer] == 0) {
+                s->t_done[j.layer] = t2;
+            }
+        } else {
+            // not locked: VirtualUnlock just drops the pages from the working set (they stay cached in standby)
+            VirtualUnlock(j.p, j.n);
+        }
+#else
+        (void) j;
+#endif
+    }
+}
+
+#ifdef _WIN32
+// a kernel that spins on %globaltimer for the given number of ns (one warp)
+const char * KA_PTX =
+    ".version 7.0\n"
+    ".target sm_52\n"
+    ".address_size 64\n"
+    ".visible .entry spin(.param .u64 ns)\n"
+    "{\n"
+    "  .reg .u64 %rd<5>;\n"
+    "  .reg .pred %p;\n"
+    "  ld.param.u64 %rd1, [ns];\n"
+    "  mov.u64 %rd2, %globaltimer;\n"
+    "  add.u64 %rd3, %rd2, %rd1;\n"
+    "L:\n"
+    "  mov.u64 %rd4, %globaltimer;\n"
+    "  setp.lt.u64 %p, %rd4, %rd3;\n"
+    "  @%p bra L;\n"
+    "  ret;\n"
+    "}\n";
+
+void keepalive_thread(state * s) {
+    typedef int cu_t;
+    HMODULE h = LoadLibraryW(L"nvcuda.dll");
+    if (!h) {
+        std::fprintf(stderr, "gpu-keepalive: no nvcuda.dll\n");
+        return;
+    }
+    cu_t (*cuInit)(unsigned) = nullptr;
+    cu_t (*cuDeviceGet)(int *, int) = nullptr;
+    cu_t (*cuDevicePrimaryCtxRetain)(void **, int) = nullptr;
+    cu_t (*cuCtxSetCurrent)(void *) = nullptr;
+    cu_t (*cuModuleLoadData)(void **, const void *) = nullptr;
+    cu_t (*cuModuleGetFunction)(void **, void *, const char *) = nullptr;
+    cu_t (*cuCtxGetStreamPriorityRange)(int *, int *) = nullptr;
+    cu_t (*cuStreamCreateWithPriority)(void **, unsigned, int) = nullptr;
+    cu_t (*cuEventCreate)(void **, unsigned) = nullptr;
+    cu_t (*cuEventRecord)(void *, void *) = nullptr;
+    cu_t (*cuEventSynchronize)(void *) = nullptr;
+    cu_t (*cuLaunchKernel)(void *, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, void *, void **, void **) = nullptr;
+#define KA_SYM(f) f = (decltype(f)) (void *) GetProcAddress(h, #f)
+    KA_SYM(cuInit); KA_SYM(cuDeviceGet); KA_SYM(cuDevicePrimaryCtxRetain); KA_SYM(cuCtxSetCurrent);
+    KA_SYM(cuModuleLoadData); KA_SYM(cuModuleGetFunction); KA_SYM(cuCtxGetStreamPriorityRange);
+    KA_SYM(cuStreamCreateWithPriority); KA_SYM(cuEventCreate); KA_SYM(cuEventRecord); KA_SYM(cuEventSynchronize);
+    KA_SYM(cuLaunchKernel);
+#undef KA_SYM
+    if (!cuInit || !cuLaunchKernel || !cuEventSynchronize) {
+        std::fprintf(stderr, "gpu-keepalive: missing driver entry points\n");
+        return;
+    }
+    int   dev = 0, lo = 0, hi = 0, r = 0;
+    void *ctx = nullptr, *mod = nullptr, *fn = nullptr, *st = nullptr, *ev[2] = { nullptr, nullptr };
+    if ((r = cuInit(0)) || (r = cuDeviceGet(&dev, 0)) || (r = cuDevicePrimaryCtxRetain(&ctx, dev)) || (r = cuCtxSetCurrent(ctx)) ||
+        (r = cuModuleLoadData(&mod, KA_PTX)) || (r = cuModuleGetFunction(&fn, mod, "spin")) ||
+        (r = cuCtxGetStreamPriorityRange(&lo, &hi)) ||
+        (r = cuStreamCreateWithPriority(&st, 0x1 /* CU_STREAM_NON_BLOCKING */, lo)) ||
+        (r = cuEventCreate(&ev[0], 0x1 | 0x2 /* BLOCKING_SYNC | DISABLE_TIMING */)) ||
+        (r = cuEventCreate(&ev[1], 0x1 | 0x2))) {
+        std::fprintf(stderr, "gpu-keepalive: CUDA driver error %d during setup\n", r);
+        return;
+    }
+    std::fprintf(stderr, "gpu-keepalive: on (%d us spins while the CPU computes the experts, stream priority %d)\n", s->ka_spin_us, lo);
+    uint64_t ns     = (uint64_t) s->ka_spin_us * 1000;
+    void *   args[] = { &ns };
+    for (;;) {
+        {
+            std::unique_lock<std::mutex> lock(s->ka_mu);
+            s->ka_cv.wait(lock, [s] { return s->ka_window.load() != 0; });
+        }
+        // one kernel at a time: the GPU work after the window waits for at most one spin. A window that is never
+        // closed (a graph without "ffn_moe_out-N") ends after 2 s, so an idle server does not keep the GPU busy.
+        const int64_t t_open = now_ns();
+        while (s->ka_window.load()) {
+            if (now_ns() - t_open > 2000000000LL) {
+                s->ka_window = 0;
+                break;
+            }
+            if ((r = cuLaunchKernel(fn, 1, 1, 1, 32, 1, 1, 0, st, args, nullptr)) || (r = cuEventRecord(ev[0], st))) {
+                std::fprintf(stderr, "gpu-keepalive: CUDA driver error %d, stopping\n", r);
+                return;
+            }
+            cuEventSynchronize(ev[0]);
+            s->ka_kernels++;
+        }
+    }
+}
+
+// MUL_MAT_ID asks for expert `e` of weight `src0` (every compute thread, every expert): the cached slice, waiting while
+// it is being read, or nullptr (not cached: the mapped file)
+const void * ec_hook(const ggml_tensor * src0, int64_t e, void * ud) {
+    state *    s  = (state *) ud;
+    ec_cache & ec = s->ec;
+    const auto it = ec.tkey.find(src0);
+    if (it == ec.tkey.end() || e < 0 || e >= ec.n_expert) {
+        return nullptr;
+    }
+    const int     il = it->second / 3;
+    const int     k  = it->second % 3;
+    const int64_t u  = (int64_t) il * ec.n_expert + e;
+    std::atomic<uint8_t> & r = ec.ready[u * 3 + k];
+    uint8_t v = r.load(std::memory_order_acquire);
+    if (v == 0) {
+        return nullptr;
+    }
+    if (v == 1) {
+        const int64_t t0 = now_ns();
+        for (int i = 0; i < 1000 && (v = r.load(std::memory_order_acquire)) == 1; ++i) {
+            YieldProcessor();
+        }
+        while (v == 1) {
+            uint8_t one = 1;
+            if (p_wait_on_address) {
+                p_wait_on_address((volatile VOID *) &r, &one, 1, 5);
+            } else {
+                Sleep(0);
+            }
+            v = r.load(std::memory_order_acquire);
+        }
+        ec.n_wait++;
+        ec.ns_wait += now_ns() - t0;
+        if (v != 2) {
+            return nullptr;
+        }
+    }
+    const ec_layer & li = ec.L[il];
+    const ec_class & c  = ec.cls[li.cls];
+    return c.mem + (int64_t) ec.slot[u] * c.slot_size + li.off[k];
+}
+
+// false while expert `e` of weight `src0` is being read: MUL_MAT_ID then does the experts that are there first
+bool ec_ready(const ggml_tensor * src0, int64_t e, void * ud) {
+    ec_cache & ec = ((state *) ud)->ec;
+    const auto it = ec.tkey.find(src0);
+    if (it == ec.tkey.end() || e < 0 || e >= ec.n_expert) {
+        return true;
+    }
+    const int64_t u = (int64_t) (it->second / 3) * ec.n_expert + e;
+    return ec.ready[u * 3 + it->second % 3].load(std::memory_order_acquire) != 1;
+}
+
+// once every layer's weights are known: read the index, check it against the weights, allocate and lock the cache,
+// install the hook
+bool ec_init(state & s) {
+    ec_cache & ec = s.ec;
+    const int  n_layers = (int) s.layers.size();
+    FILE * f = std::fopen((ec.prefix + ".index").c_str(), "r");
+    if (!f) {
+        std::fprintf(stderr, "expert-cache: cannot open %s.index, off\n", ec.prefix.c_str());
+        return false;
+    }
+    ec.L.assign(n_layers, ec_layer());
+    std::vector<bool> got(n_layers, false);
+    char line[512];
+    while (std::fgets(line, sizeof line, f)) {
+        int L = 0, ne = 0;
+        long long base = 0, unit = 0, g = 0, up = 0, d = 0;
+        if (std::sscanf(line, "%d %lld %lld %lld %lld %lld %d", &L, &base, &unit, &g, &up, &d, &ne) != 7 || L < 0 || L >= n_layers) {
+            continue;
+        }
+        ec_layer & li = ec.L[L];
+        li.base  = base;
+        li.unit  = unit;
+        li.sz[0] = g;  li.sz[1] = up;    li.sz[2] = d;
+        li.off[0] = 0; li.off[1] = g;    li.off[2] = g + up;
+        got[L]      = unit == g + up + d;
+        ec.n_expert = ne;
+    }
+    std::fclose(f);
+    int64_t sum_units = 0;
+    for (int L = 0; L < n_layers; ++L) {
+        const layer_weights & lw = s.layers[L];
+        for (int k = 0; k < 3; ++k) {
+            const ggml_tensor * w = lw.w[k];
+            if (!got[L] || !w || (int64_t) w->nb[2] != ec.L[L].sz[k] || w->ne[2] != ec.n_expert) {
+                std::fprintf(stderr, "expert-cache: layer %d does not match %s.index, off\n", L, ec.prefix.c_str());
+                return false;
+            }
+            ec.tkey[w] = L * 3 + k;
+        }
+        sum_units += ec.L[L].unit;
+        int c = 0;
+        for (; c < (int) ec.cls.size() && ec.cls[c].slot_size != ec.L[L].unit; ++c) {}
+        if (c == (int) ec.cls.size()) {
+            ec.cls.emplace_back();
+            ec.cls.back().slot_size = ec.L[L].unit;
+        }
+        ec.cls[c].n_layers++;
+        ec.L[L].cls = c;
+    }
+    // every layer selects the same number of experts per token: slots per class in proportion to its layers
+    const int64_t budget    = (int64_t) (ec.gb * (double) (1ll << 30));
+    const int     per_layer = (int) (budget / std::max<int64_t>(1, sum_units));
+    if (per_layer < 16) {
+        std::fprintf(stderr, "expert-cache: %.1f GB is too small, off\n", ec.gb);
+        return false;
+    }
+    ec.max_unique = per_layer / 2;
+    int64_t total = 0;
+    for (auto & c : ec.cls) {
+        c.n_slots = per_layer * c.n_layers;
+        total += c.n_slots * c.slot_size;
+    }
+    // the locked cache counts in the working set: min = cache + 256 MB (VirtualLock needs it), hard max = cache + the
+    // mapped part's share (prompts, the n-gram embedding rows, everything else)
+    const SIZE_T ws_min = (SIZE_T) (total + (256ll << 20));
+    const SIZE_T ws_max = (SIZE_T) (total + (int64_t) (ec.mmap_gb * (double) (1ll << 30)));
+    if (!SetProcessWorkingSetSizeEx(GetCurrentProcess(), ws_min, ws_max, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_ENABLE)) {
+        std::fprintf(stderr, "expert-cache: SetProcessWorkingSetSizeEx failed (%lu)\n", GetLastError());
+    }
+    const int64_t t0 = now_ns();
+    bool locked = true;
+    for (auto & c : ec.cls) {
+        const size_t n = (size_t) c.n_slots * c.slot_size;
+        c.mem = (char *) VirtualAlloc(nullptr, n, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (!c.mem) {
+            std::fprintf(stderr, "expert-cache: cannot allocate %.2f GB (%lu), off\n", n / 1e9, GetLastError());
+            return false;
+        }
+        if (!VirtualLock(c.mem, n)) {
+            std::fprintf(stderr, "expert-cache: VirtualLock failed (%lu), the cache may be paged out\n", GetLastError());
+            locked = false;
+            for (size_t o = 0; o < n; o += 4096) {
+                c.mem[o] = 0;
+            }
+        }
+        c.owner.assign(c.n_slots, -1);
+        c.pos.resize(c.n_slots);
+        for (int i = 0; i < c.n_slots; ++i) {
+            c.lru.push_back(i);
+            c.pos[i] = std::prev(c.lru.end());
+        }
+    }
+    const int64_t n_units = (int64_t) n_layers * ec.n_expert;
+    ec.slot.assign((size_t) n_units, -1);
+    ec.spec.assign((size_t) n_units, 0);
+    ec.ready.reset(new std::atomic<uint8_t>[(size_t) n_units * 3]);
+    for (int64_t i = 0; i < n_units * 3; ++i) {
+        ec.ready[i].store(0);
+    }
+    ec_load_sync_api();
+    typedef void (*set_fn_t)(ggml_cpu_expert_data_fn, void *);
+    ggml_backend_reg_t reg = ggml_backend_reg_by_name("CPU");
+    set_fn_t set_fn = reg ? (set_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_cpu_set_expert_data_fn") : nullptr;
+    if (!set_fn) {
+        std::fprintf(stderr, "expert-cache: the CPU backend has no ggml_cpu_set_expert_data_fn (not the patched ggml-cpu?), off\n");
+        return false;
+    }
+    set_fn(ec_hook, &s);
+    if (ec.reorder) {
+        typedef void (*set_ready_t)(ggml_cpu_expert_ready_fn);
+        set_ready_t set_ready = (set_ready_t) ggml_backend_reg_get_proc_address(reg, "ggml_cpu_set_expert_ready_fn");
+        if (set_ready) {
+            set_ready(ec_ready);
+        }
+    }
+    std::fprintf(stderr, "expert-cache: on, %s.bin, %.2f GB (%d experts per layer, %zu size classes)%s in %.1f s, working set %.2f-%.2f GB\n",
+                 ec.prefix.c_str(), total / 1e9, per_layer, ec.cls.size(), locked ? " locked" : "", (now_ns() - t0) / 1e9,
+                 ws_min / 1e9, ws_max / 1e9);
+    return true;
+}
+
+// a slot for unit u of class c: the least recently used one whose unit is not being read (-1 if none in 64 tries).
+// The old unit is dropped. cold = put it at the cold end of the LRU (a read-ahead that may be wrong), else the hot end
+int ec_take_slot(ec_cache & ec, ec_class & c, int64_t u, bool cold) {
+    int  victim = -1;
+    auto it     = std::prev(c.lru.end());
+    for (int tries = 0; tries < 64; ++tries) {
+        const int own  = c.owner[*it];
+        bool      busy = false;
+        for (int k = 0; own >= 0 && k < 3; ++k) {
+            busy = busy || ec.ready[(size_t) own * 3 + k].load() == 1;
+        }
+        if (!busy) {
+            victim = *it;
+            break;
+        }
+        if (it == c.lru.begin()) {
+            break;
+        }
+        --it;
+    }
+    if (victim < 0) {
+        return -1;
+    }
+    const int own = c.owner[victim];
+    if (own >= 0) {
+        ec.slot[own] = -1;
+        ec.spec[own] = 0;
+        for (int k = 0; k < 3; ++k) {
+            ec.ready[(size_t) own * 3 + k].store(0);
+        }
+    }
+    c.owner[victim] = (int32_t) u;
+    ec.slot[u]      = victim;
+    c.lru.splice(cold ? c.lru.end() : c.lru.begin(), c.lru, c.pos[victim]);
+    for (int k = 0; k < 3; ++k) {
+        ec.ready[(size_t) u * 3 + k].store(1);
+    }
+    return victim;
+}
+
+// read jobs for the given experts of layer il (all gate slices first, then up, then down: the order MUL_MAT_ID uses them)
+std::vector<job> ec_jobs(ec_cache & ec, int il, const std::vector<int32_t> & experts, int layer_tag, int64_t t_push) {
+    const ec_layer & li = ec.L[il];
+    ec_class &       c  = ec.cls[li.cls];
+    std::vector<job> jobs;
+    for (int k = 0; k < 3; ++k) {
+        for (int32_t e : experts) {
+            const int64_t u = (int64_t) il * ec.n_expert + e;
+            job j;
+            j.kind   = JOB_READ;
+            j.p      = c.mem + (int64_t) ec.slot[u] * c.slot_size + li.off[k];
+            j.n      = (size_t) li.sz[k];
+            j.layer  = layer_tag;
+            j.t_push = t_push;
+            j.foff   = li.base + (int64_t) e * li.unit + li.off[k];
+            j.rd     = (int32_t) (u * 3 + k);
+            jobs.push_back(j);
+        }
+    }
+    return jobs;
+}
+
+// the cache path of a layer's routing result: hits move to the hot end of the LRU, misses take the least recently used
+// slots and are read. Read-ahead jobs of this layer still queued are moved in front if needed, dropped if not.
+// false = the batch selects too many experts (prompt): the mapped file then
+bool ec_route(state & s, int il, const std::vector<int32_t> & uniq, int64_t t_push) {
+    ec_cache & ec = s.ec;
+    if ((int) uniq.size() > ec.max_unique) {
+        return false;
+    }
+    const ec_layer & li = ec.L[il];
+    ec_class &       c  = ec.cls[li.cls];
+    std::vector<job> promoted;
+    {
+        std::lock_guard<std::mutex> lock(s.mu);
+        if (!s.mid.empty()) {
+            std::vector<uint8_t> need((size_t) ec.n_expert, 0);
+            for (int32_t e : uniq) {
+                need[e] = 1;
+            }
+            // jobs still queued are not in flight (workers take jobs under this lock): a dropped slice is marked not
+            // cached; a unit with no slice read or being read gives its slot back
+            std::vector<int64_t> dropped;
+            for (const job & j : s.mid) {
+                const int64_t u = j.rd / 3;
+                if (u / ec.n_expert == il && need[u % ec.n_expert]) {
+                    promoted.push_back(j);
+                } else {
+                    ec.ready[j.rd].store(0);
+                    if (std::find(dropped.begin(), dropped.end(), u) == dropped.end()) {
+                        dropped.push_back(u);
+                    }
+                }
+            }
+            s.mid.clear();
+            for (int64_t u : dropped) {
+                bool any = false;
+                for (int k = 0; k < 3; ++k) {
+                    any = any || ec.ready[(size_t) u * 3 + k].load() != 0;
+                }
+                const int sl = ec.slot[u];
+                if (sl >= 0 && !any) {
+                    ec.cls[ec.L[u / ec.n_expert].cls].owner[sl] = -1;
+                    ec.slot[u] = -1;
+                    ec.spec[u] = 0;
+                }
+                s.pr_drop++;
+            }
+        }
+    }
+    std::vector<int32_t> miss;
+    std::vector<job>     repair;   // cached units with a slice not read (a dropped read-ahead, a failed read)
+    for (int32_t e : uniq) {
+        const int64_t u  = (int64_t) il * ec.n_expert + e;
+        const int     sl = ec.slot[u];
+        if (sl >= 0) {
+            c.lru.splice(c.lru.begin(), c.lru, c.pos[sl]);
+            ec.n_hit++;
+            for (int k = 0; k < 3; ++k) {
+                uint8_t zero = 0;
+                if (ec.ready[(size_t) u * 3 + k].compare_exchange_strong(zero, 1)) {
+                    job j;
+                    j.kind   = JOB_READ;
+                    j.p      = c.mem + (int64_t) sl * c.slot_size + li.off[k];
+                    j.n      = (size_t) li.sz[k];
+                    j.layer  = -1;
+                    j.t_push = t_push;
+                    j.foff   = li.base + (int64_t) e * li.unit + li.off[k];
+                    j.rd     = (int32_t) (u * 3 + k);
+                    repair.push_back(j);
+                }
+            }
+        } else {
+            miss.push_back(e);
+        }
+    }
+    promoted.insert(promoted.end(), repair.begin(), repair.end());
+    std::vector<int32_t> loaded;
+    for (int32_t e : miss) {
+        if (ec_take_slot(ec, c, (int64_t) il * ec.n_expert + e, false) < 0) {
+            break;   // the rest come from the mapped file
+        }
+        ec.n_miss++;
+        loaded.push_back(e);
+    }
+    std::vector<job> jobs = ec_jobs(ec, il, loaded, il, t_push);
+    s.t_done[il]  = jobs.empty() ? now_ns() : 0;
+    s.pending[il] = (int) jobs.size();
+    if (!jobs.empty() || !promoted.empty()) {
+        {
+            std::lock_guard<std::mutex> lock(s.mu);
+            // read-ahead slices that turned out to be needed first: they were predicted, so they are likely in flight
+            for (const job & j : promoted) {
+                s.hi.push_back(j);
+            }
+            for (const job & j : jobs) {
+                s.hi.push_back(j);
+            }
+        }
+        s.cv.notify_all();
+    }
+    return true;
+}
+
+// read ahead the first k predicted experts of layer il that are not cached (low priority, cold end of the LRU)
+void ec_speculate(state & s, int il, const std::vector<int32_t> & ranked, int k, int64_t t_push) {
+    ec_cache & ec = s.ec;
+    ec_class & c  = ec.cls[ec.L[il].cls];
+    std::vector<int32_t> todo;
+    for (int i = 0; i < k && i < (int) ranked.size(); ++i) {
+        const int64_t u = (int64_t) il * ec.n_expert + ranked[i];
+        if (ec.slot[u] >= 0) {
+            continue;
+        }
+        if (ec_take_slot(ec, c, u, true) < 0) {
+            break;
+        }
+        ec.spec[u] = 1;
+        s.pr_spec++;
+        todo.push_back(ranked[i]);
+    }
+    if (todo.empty()) {
+        return;
+    }
+    std::vector<job> jobs = ec_jobs(ec, il, todo, -1, t_push);
+    {
+        std::lock_guard<std::mutex> lock(s.mu);
+        for (const job & j : jobs) {
+            s.mid.push_back(j);
+        }
+    }
+    s.cv.notify_all();
+}
+#endif
+
+void start(state & s) {
+    s.n_workers = std::max(1, env_int("LLAMA_EXPERT_PREFETCH_WORKERS", 6));
+    s.chunk     = (size_t) std::max(64, env_int("LLAMA_EXPERT_PREFETCH_CHUNK_KB", 2048)) << 10;
+    s.touch     = env_int("LLAMA_EXPERT_PREFETCH_TOUCH", 1) != 0;
+    s.evict     = std::max(0, env_int("LLAMA_EXPERT_PREFETCH_EVICT", 2));
+    s.stats     = env_int("LLAMA_EXPERT_PREFETCH_STATS", 0) != 0;
+    s.timing    = env_int("LLAMA_EXPERT_PREFETCH_TIMING", 0) != 0;
+    s.diag      = env_int("LLAMA_EXPERT_PREFETCH_DIAG", 0) != 0;
+    s.ka_spin_us = std::max(0, env_int("LLAMA_GPU_KEEPALIVE", 0));
+    if (s.ka_spin_us > 0) {
+        s.timing = true;   // the window ends at "ffn_moe_out-N"
+    }
+    if (const char * g = std::getenv("LLAMA_EXPERT_CACHE_GB")) {
+        s.ec.gb = std::atof(g);
+    }
+    if (const char * g = std::getenv("LLAMA_EXPERT_CACHE_MMAP_GB")) {
+        s.ec.mmap_gb = std::max(0.5, std::atof(g));
+    }
+    if (const char * p = std::getenv("LLAMA_EXPERT_CACHE_FILE")) {
+        s.ec.prefix = p;
+    }
+    s.ec.on = false;   // set by ec_init on the first pass that knows every layer
+    s.pred_on = env_int("LLAMA_EXPERT_PREDICT", 0) > 0;
+    s.pred_k  = std::max(0, env_int("LLAMA_EXPERT_PREDICT_K", 0));
+    s.mid_max = std::max(1, env_int("LLAMA_EXPERT_PREDICT_WORKERS", 3));
+    s.out_time = env_int("LLAMA_EXPERT_PREFETCH_OUTTIME", 0) != 0;
+    s.ec.reorder = env_int("LLAMA_EXPERT_CACHE_REORDER", 1) != 0;
+    if (s.diag) {
+        s.stats = true;
+#ifdef _WIN32
+        s.disk = CreateFileW(L"\\\\.\\PhysicalDrive0", 0, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (s.disk == INVALID_HANDLE_VALUE) {
+            std::fprintf(stderr, "expert-prefetch: cannot open PhysicalDrive0 (%lu), no disk counters\n", GetLastError());
+        }
+#endif
+    }
+    if (const char * tp = std::getenv("LLAMA_EXPERT_PREFETCH_TRACE")) {
+        if (*tp) {
+            s.trace = std::fopen(tp, "a");
+            if (!s.trace) {
+                std::fprintf(stderr, "expert-prefetch: cannot open trace file %s\n", tp);
+            }
+        }
+    }
+    for (int i = 0; i < s.n_workers; ++i) {
+        s.threads.emplace_back(worker, &s);
+        s.threads.back().detach();
+    }
+    std::fprintf(stderr, "expert-prefetch: on (%d workers, %zu KiB jobs, touch %d, evict %d layers back, diag %d, trace %s)\n",
+                 s.n_workers, s.chunk >> 10, (int) s.touch, s.evict, (int) s.diag, s.trace ? "on" : "off");
+}
+
+void note_weight(state & s, const ggml_tensor * w) {
+    if (!w || !w->buffer || !ggml_backend_buffer_is_host(w->buffer) || w->ne[2] < 2) {
+        return;
+    }
+    int il = 0, slot = 0;
+    if (!parse_weight(w->name, il, slot) || il < 0 || il >= MAX_LAYERS) {
+        return;
+    }
+    if ((int) s.layers.size() <= il) {
+        s.layers.resize(il + 1);
+        s.used.resize(il + 1);
+    }
+    s.layers[il].w[slot] = const_cast<ggml_tensor *>(w);
+}
+
+void print_diag(state & s, double dt) {
+#ifdef _WIN32
+    char disk[160] = "disk n/a";
+    if (s.disk != INVALID_HANDLE_VALUE) {
+        DISK_PERFORMANCE dp{};
+        DWORD            nb = 0;
+        if (DeviceIoControl(s.disk, IOCTL_DISK_PERFORMANCE, nullptr, 0, &dp, sizeof(dp), &nb, nullptr)) {
+            if (s.dp_last.QueryTime.QuadPart) {
+                const double mb  = (dp.BytesRead.QuadPart - s.dp_last.BytesRead.QuadPart) / 1e6;
+                const long   nr  = (long) (dp.ReadCount - s.dp_last.ReadCount);
+                const double rt  = (dp.ReadTime.QuadPart - s.dp_last.ReadTime.QuadPart) * 1e-7;   // summed over reads
+                std::snprintf(disk, sizeof(disk), "disk %.0f MB in %ld reads (avg %.0f KB, %.0f us each, QD %.2f)",
+                              mb, nr, nr ? mb * 1e3 / nr : 0.0, nr ? rt * 1e6 / nr : 0.0, dt > 0 ? rt / dt : 0.0);
+            }
+            s.dp_last = dp;
+        }
+    }
+    FILETIME fc, fe, fk, fu;
+    uint64_t k = 0, u = 0;
+    if (GetProcessTimes(GetCurrentProcess(), &fc, &fe, &fk, &fu)) {
+        k = ft_u64(fk);
+        u = ft_u64(fu);
+    }
+    const DWORD faults = page_faults();
+    const int64_t pg    = s.pg_total.exchange(0);
+    const int64_t ws0   = s.pg_ws0.exchange(0);
+    const int64_t ws1   = s.pg_ws1.exchange(0);
+    const int64_t cold  = s.pg_cold.exchange(0);
+    const int64_t njc   = s.n_job_cold.exchange(0);
+    const int64_t njw   = s.n_job_warm.exchange(0);
+    const int64_t pfc   = s.ns_pf_cold.exchange(0);
+    const int64_t pfw   = s.ns_pf_warm.exchange(0);
+    const int64_t tcc   = s.ns_touch_cold.exchange(0);
+    const int64_t tcw   = s.ns_touch_warm.exchange(0);
+    const int64_t wait  = s.ns_wait.exchange(0);
+    const int64_t q     = s.ns_query.exchange(0);
+    const int     bmax  = s.busy_max.exchange(0);
+    plog(
+                 "expert-prefetch: diag pass %lld | %.1fk pages, in WS %.1f%% before / %.1f%% after prefetch | %s | faults %lu "
+                 "| cold jobs %lld: prefetch %.0f us, touch %.0f us = %.2f us/page (%.1fk pages) | warm jobs %lld: prefetch %.0f us, touch %.0f us "
+                 "| queue wait %.0f us/job, busy max %d | cpu kernel %.0f ms, user %.0f ms | query %.3f s\n",
+                 (long long) s.n_pass, pg / 1e3, pg ? 100.0 * ws0 / pg : 0.0, pg ? 100.0 * ws1 / pg : 0.0, disk,
+                 (unsigned long) (s.faults_last ? faults - s.faults_last : 0),
+                 (long long) njc, njc ? pfc / 1e3 / njc : 0.0, njc ? tcc / 1e3 / njc : 0.0, cold ? tcc / 1e3 / cold : 0.0, cold / 1e3,
+                 (long long) njw, njw ? pfw / 1e3 / njw : 0.0, njw ? tcw / 1e3 / njw : 0.0,
+                 (njc + njw) ? wait / 1e3 / (njc + njw) : 0.0, bmax,
+                 s.k_last ? (k - s.k_last) / 1e4 : 0.0, s.u_last ? (u - s.u_last) / 1e4 : 0.0, q / 1e9);
+    s.k_last      = k;
+    s.u_last      = u;
+    s.faults_last = faults;
+#else
+    (void) s;
+    (void) dt;
+#endif
+}
+
+void print_pass(state & s) {
+    const auto   t_now = std::chrono::steady_clock::now();
+    const double dt    = std::chrono::duration<double>(t_now - s.t_last).count();
+    s.t_last = t_now;
+    char timing[512] = "";
+    if (s.timing) {
+        // per pass, summed over layers: routing known -> MoE output ready (CPU experts, incl. waiting for pages),
+        // routing known -> all slices in (workers), MoE output of layer i-1 -> routing of layer i (GPU side)
+        int64_t moe = 0, fetch = 0, gpu = 0, late = 0;
+        const int n_layers = (int) s.layers.size();
+        for (int i = 0; i < n_layers; ++i) {
+            if (!s.t_topk[i] || !s.t_moe[i]) {
+                continue;
+            }
+            moe += s.t_moe[i] - s.t_topk[i];
+            const int64_t done = s.t_done[i];
+            if (done > s.t_topk[i]) {
+                fetch += done - s.t_topk[i];
+                late  += std::max<int64_t>(0, done - s.t_moe[i]);
+            }
+            if (i > 0 && s.t_moe[i - 1] && s.t_topk[i] > s.t_moe[i - 1]) {
+                gpu += s.t_topk[i] - s.t_moe[i - 1];
+            }
+        }
+        // the rest of the pass: last layer's MoE output -> next graph's first node (output layer, sampling, server),
+        // graph start -> layer 0's routing (inputs, embeddings, layer 0 up to its router)
+        const double between = s.t_pass_end_prev && s.t_graph_start > s.t_pass_end_prev ? (s.t_graph_start - s.t_pass_end_prev) / 1e9 : 0.0;
+        const double head    = s.t_topk[0] > s.t_graph_start && s.t_graph_start ? (s.t_topk[0] - s.t_graph_start) / 1e9 : 0.0;
+        std::snprintf(timing, sizeof(timing), " | moe %.3f s, fetch %.3f s, gpu %.3f s (slices in after the MoE: %.3f s), between %.3f s, head %.3f s"
+                      ", start_ns %lld, end_ns %lld%s",
+                      moe / 1e9, fetch / 1e9, gpu / 1e9, late / 1e9, between, head, (long long) s.t_graph_start,
+                      (long long) (n_layers > 0 ? s.t_moe[n_layers - 1] : 0), s.ka_spin_us > 0 ? " | keepalive" : "");
+        if (s.ka_spin_us > 0) {
+            const size_t l = std::strlen(timing);
+            std::snprintf(timing + l, sizeof(timing) - l, " %lld kernels", (long long) s.ka_kernels.exchange(0));
+        }
+    }
+    plog( "expert-prefetch: pass %.2f s | rows %lld | experts/layer %.1f | prefetched %.2f GB "
+                         "(prefetch %.2f s, touch %.2f s, summed over workers)%s\n",
+                 dt, (long long) (s.n_rows / std::max<int64_t>(1, s.n_topk)), (double) s.n_unique / std::max<int64_t>(1, s.n_topk),
+                 s.bytes_prefetched.exchange(0) / 1e9, s.ns_prefetch.exchange(0) / 1e9, s.ns_touch.exchange(0) / 1e9, timing);
+    if (s.diag) {
+        print_diag(s, dt);
+    }
+    if (s.ec.on) {
+        ec_cache &    ec   = s.ec;
+        const int64_t hit  = ec.n_hit.exchange(0), miss = ec.n_miss.exchange(0), nr = ec.n_read.exchange(0);
+        const int64_t nw   = ec.n_wait.exchange(0), nsw = ec.ns_wait.exchange(0);
+        const int64_t rb   = ec.bytes_read.exchange(0), nsr = ec.ns_read.exchange(0);
+        plog( "expert-cache: hit %lld miss %lld (%.1f%%) | read %.0f MB in %lld reads, %.0f us each | "
+                             "compute threads waited %lld times, %.3f s summed\n",
+                     (long long) hit, (long long) miss, (hit + miss) ? 100.0 * hit / (hit + miss) : 0.0, rb / 1e6, (long long) nr,
+                     nr ? nsr / 1e3 / nr : 0.0, (long long) nw, nsw / 1e9);
+    }
+    if (s.pred_on && s.pr_layers) {
+        const double n = (double) std::max<int64_t>(1, s.pr_n), m = (double) std::max<int64_t>(1, s.pr_miss);
+        plog( "expert-predict: recall @10 %.0f%% @16 %.0f%% @24 %.0f%% @32 %.0f%% | not cached %lld, of them predicted "
+                             "@10 %.0f%% @16 %.0f%% @24 %.0f%% @32 %.0f%% | read ahead %lld (k %d), used %lld, dropped %lld | %.1f ms\n",
+                     100 * s.pr_hit[0] / n, 100 * s.pr_hit[1] / n, 100 * s.pr_hit[2] / n, 100 * s.pr_hit[3] / n, (long long) s.pr_miss,
+                     100 * s.pr_cov[0] / m, 100 * s.pr_cov[1] / m, 100 * s.pr_cov[2] / m, 100 * s.pr_cov[3] / m,
+                     (long long) s.pr_spec, s.pred_k, (long long) s.pr_spec_used, (long long) s.pr_drop, s.pr_ns / 1e6);
+        s.pr_layers = s.pr_n = s.pr_miss = s.pr_spec = s.pr_spec_used = s.pr_drop = s.pr_ns = 0;
+        for (int q = 0; q < 4; ++q) {
+            s.pr_hit[q] = s.pr_cov[q] = 0;
+        }
+    }
+    s.n_topk = s.n_unique = s.n_rows = 0;
+}
+
+// how well the prediction made one layer earlier matches this layer's routing: overall, and over the experts that
+// were not cached (or only read ahead), for the top 10/16/24/32 predicted
+void pred_score(state & s, int il, const std::vector<int32_t> & uniq) {
+    if (il >= (int) s.pred_rank.size() || s.pred_rank[il].empty()) {
+        return;
+    }
+    static const int K[4] = { 10, 16, 24, 32 };
+    const std::vector<int32_t> & r = s.pred_rank[il];
+    s.pr_layers++;
+    s.pr_n += (int64_t) uniq.size();
+    for (int32_t e : uniq) {
+        const int pos = (int) (std::find(r.begin(), r.end(), e) - r.begin());
+        for (int q = 0; q < 4; ++q) {
+            s.pr_hit[q] += pos < K[q];
+        }
+        if (s.ec.on) {
+            const size_t u = (size_t) il * s.ec.n_expert + e;
+            if (s.ec.slot[u] < 0 || s.ec.spec[u]) {
+                s.pr_miss++;
+                for (int q = 0; q < 4; ++q) {
+                    s.pr_cov[q] += pos < K[q];
+                }
+            }
+            if (s.ec.spec[u]) {
+                s.pr_spec_used++;
+                s.ec.spec[u] = 0;
+            }
+        }
+    }
+    s.pred_rank[il].clear();
+}
+
+void on_topk(state & s, ggml_tensor * t, int il) {
+    if (il >= (int) s.layers.size()) {
+        return;   // weights of this layer not seen yet (first pass)
+    }
+    s.t_topk[il] = now_ns();
+    s.t_moe[il]  = 0;
+    const layer_weights & lw = s.layers[il];
+    const ggml_tensor * any = lw.w[0] ? lw.w[0] : lw.w[1] ? lw.w[1] : lw.w[2];
+    if (!any || t->type != GGML_TYPE_I32) {
+        return;
+    }
+    const int64_t n_expert = any->ne[2];
+    const int64_t k        = t->ne[0];
+    const int64_t rows     = t->ne[1];
+
+    // the routing result is a strided view (top k of an argsort), possibly in GPU memory: read row by row
+    s.ids.resize((size_t) (k * rows));
+    const bool host = t->buffer && ggml_backend_buffer_is_host(t->buffer);
+    for (int64_t r = 0; r < rows; ++r) {
+        if (host) {
+            std::memcpy(s.ids.data() + r * k, (const char *) t->data + r * t->nb[1], (size_t) k * sizeof(int32_t));
+        } else {
+            ggml_backend_tensor_get(t, s.ids.data() + r * k, (size_t) (r * t->nb[1]), (size_t) k * sizeof(int32_t));
+        }
+    }
+    s.seen.assign((size_t) n_expert, 0);
+    int64_t n_unique = 0;
+    for (int32_t e : s.ids) {
+        if (e >= 0 && e < n_expert && !s.seen[e]) {
+            s.seen[e] = 1;
+            ++n_unique;
+        }
+    }
+
+    if (s.trace) {
+        // "<pass> <layer> <rows> <experts...>": one row = the k experts in rank order, more rows = the distinct ones
+        std::fprintf(s.trace, "%lld %d %lld", (long long) s.n_pass, il, (long long) rows);
+        if (rows == 1) {
+            for (int32_t e : s.ids) {
+                std::fprintf(s.trace, " %d", e);
+            }
+        } else {
+            for (int64_t e = 0; e < n_expert; ++e) {
+                if (s.seen[e]) {
+                    std::fprintf(s.trace, " %lld", (long long) e);
+                }
+            }
+        }
+        std::fputc('\n', s.trace);
+    }
+
+    const int64_t t_push = now_ns();
+    bool cached = false;
+#ifdef _WIN32
+    if (s.ec.gb > 0 && !s.ec.on && !s.ec.failed && il == 0) {
+        bool all = !s.layers.empty();
+        for (const auto & l : s.layers) {
+            all = all && l.w[0] && l.w[1] && l.w[2];
+        }
+        if (all) {
+            s.ec.on     = ec_init(s);
+            s.ec.failed = !s.ec.on;
+        }
+    }
+    std::vector<int32_t> uniq;
+    for (int64_t e = 0; e < n_expert; ++e) {
+        if (s.seen[e]) {
+            uniq.push_back((int32_t) e);
+        }
+    }
+    if (s.pred_on && rows == 1) {
+        pred_score(s, il, uniq);
+    }
+    if (s.ec.on) {
+        cached = ec_route(s, il, uniq, t_push);
+    }
+#endif
+    if (!cached) {
+        std::vector<job> jobs;
+        // gate and up are used first, down last: queue them in that order
+        for (int slot = 0; slot < 3; ++slot) {
+            ggml_tensor * w = lw.w[slot];
+            if (!w) {
+                continue;
+            }
+            const size_t slice = w->nb[2];
+            for (int64_t e = 0; e < n_expert; ++e) {
+                if (!s.seen[e]) {
+                    continue;
+                }
+                char * p = (char *) w->data + (size_t) e * slice;
+                for (size_t off = 0; off < slice; off += s.chunk) {
+                    jobs.push_back({ JOB_PREFETCH, p + off, std::min(s.chunk, slice - off), il, t_push, 0, 0 });
+                }
+            }
+        }
+        s.t_done[il]  = jobs.empty() ? now_ns() : 0;
+        s.pending[il] = (int) jobs.size();
+        {
+            std::lock_guard<std::mutex> lock(s.mu);
+            for (const job & j : jobs) {
+                s.hi.push_back(j);
+            }
+            if (s.evict > 0) {
+                const int n_layers = (int) s.layers.size();
+                const int old      = ((il - s.evict) % n_layers + n_layers) % n_layers;
+                for (const job & j : s.used[old]) {
+                    s.lo.push_back({ JOB_EVICT, j.p, j.n, -1, 0, 0, 0 });
+                }
+                s.used[old].clear();
+            }
+        }
+        s.cv.notify_all();
+        s.used[il] = std::move(jobs);
+    }
+
+    s.n_topk++;
+    s.n_unique += n_unique;
+    s.n_rows   += rows;
+    if (il == (int) s.layers.size() - 1) {
+        if (s.trace) {
+            std::fflush(s.trace);
+        }
+        if (s.stats && !s.timing) {
+            print_pass(s);
+        }
+        if (!s.timing) {
+            s.n_pass++;
+        }
+    }
+}
+
+#ifdef _WIN32
+// after layer il's routing: read the prediction for layer il+1 (computed in the same graph piece) and read ahead
+void on_pred(state & s, int il, int64_t rows) {
+    ggml_tensor * p = s.pred_t[il];
+    s.pred_t[il] = nullptr;   // a node of this graph only
+    if (!p || rows != 1 || il + 1 >= (int) s.layers.size() || p->type != GGML_TYPE_F32 || p->ne[1] != 1) {
+        return;
+    }
+    const int64_t t0 = now_ns();
+    struct timer {
+        state & s; int64_t t0;
+        ~timer() { s.pr_ns += now_ns() - t0; }
+    } tm{ s, t0 };
+    const int n = (int) p->ne[0];
+    s.pred_buf.resize((size_t) n);
+    ggml_backend_tensor_get(p, s.pred_buf.data(), 0, (size_t) n * sizeof(float));
+    std::vector<int32_t> idx((size_t) n);
+    for (int i = 0; i < n; ++i) {
+        idx[i] = i;
+    }
+    const int top = std::min(32, n);
+    std::partial_sort(idx.begin(), idx.begin() + top, idx.end(),
+                      [&s](int32_t a, int32_t b) { return s.pred_buf[a] > s.pred_buf[b]; });
+    if (s.pred_rank.size() < s.layers.size()) {
+        s.pred_rank.resize(s.layers.size());
+    }
+    s.pred_rank[il + 1].assign(idx.begin(), idx.begin() + top);
+    if (s.ec.on && s.pred_k > 0) {
+        ec_speculate(s, il + 1, s.pred_rank[il + 1], s.pred_k, now_ns());
+    }
+}
+#endif
+
+bool callback(ggml_tensor * t, bool ask, void * user_data) {
+    state & s = *(state *) user_data;
+    int il = 0;
+    if (ask) {
+        if (s.want_start) {
+            s.t_graph_start = now_ns();
+            s.want_start    = false;
+        }
+        if (t->op == GGML_OP_MUL_MAT_ID) {
+            note_weight(s, t->src[0]);
+        }
+        if (s.pred_on && parse_named(t->name, "ffn_moe_pred-", il) && il < MAX_LAYERS) {
+            s.pred_t[il] = t;   // not observed (no extra graph split): read at this layer's routing result
+            return false;
+        }
+        if (s.out_time && (std::strcmp(t->name, "result_output") == 0 || std::strcmp(t->name, "result_norm") == 0 ||
+                           std::strncmp(t->name, "ffn_out-", 8) == 0 || std::strncmp(t->name, "l_last-", 7) == 0)) {
+            return !s.layers.empty() && (t->name[0] == 'r' || std::atoi(std::strchr(t->name, '-') + 1) == (int) s.layers.size() - 1);
+        }
+        return parse_topk(t->name, il) || (s.timing && parse_moe_out(t->name, il));
+    }
+    if (s.out_time && t->name[0] != 'f' ? (std::strcmp(t->name, "result_norm") == 0 || std::strncmp(t->name, "l_last-", 7) == 0)
+                                        : std::strncmp(t->name, "ffn_out-", 8) == 0) {
+        plog( "expert-prefetch: %s done %.1f ms after the last MoE output\n", t->name,
+                     s.t_pass_end ? (now_ns() - s.t_pass_end) / 1e6 : 0.0);
+        return true;
+    }
+    if (parse_topk(t->name, il)) {
+        on_topk(s, t, il);
+#ifdef _WIN32
+        if (s.pred_on) {
+            on_pred(s, il, t->ne[1]);
+        }
+#endif
+#ifdef _WIN32
+        if (s.ka_spin_us > 0 && t->ne[1] == 1) {
+            // decode only (prompts keep the GPU busy anyway); the thread starts on the first decode token, not during
+            // the server's start-up (2026-10-05: one start hung right after the keep-alive set itself up there)
+            std::call_once(s.ka_once, [&s] { std::thread(keepalive_thread, &s).detach(); });
+            {
+                std::lock_guard<std::mutex> lock(s.ka_mu);
+                s.ka_window = 1;
+            }
+            s.ka_cv.notify_one();
+        }
+#endif
+    } else if (s.out_time && std::strcmp(t->name, "result_output") == 0) {
+        s.t_out = now_ns();
+        plog( "expert-prefetch: output layer done %.1f ms after the last MoE output, out_ns %lld\n",
+                     s.t_pass_end ? (s.t_out - s.t_pass_end) / 1e6 : 0.0, (long long) s.t_out);
+    } else if (parse_moe_out(t->name, il)) {
+        s.ka_window = 0;
+        s.t_moe[il] = now_ns();
+        if (il == (int) s.layers.size() - 1) {
+            s.t_pass_end_prev = s.t_pass_end;
+            if (s.stats) {
+                print_pass(s);
+            }
+            s.t_pass_end = s.t_moe[il];
+            s.want_start = true;
+            s.n_pass++;
+        }
+    }
+    return true;
+}
+
+} // namespace
+
+ggml_backend_sched_eval_callback expert_prefetch_callback(void ** user_data) {
+    if (env_int("LLAMA_EXPERT_PREFETCH", 0) == 0) {
+        return nullptr;
+    }
+    static state * s = nullptr;
+    if (!s) {
+        s = new state();
+        start(*s);
+    }
+    *user_data = s;
+    return callback;
+}
