@@ -32,6 +32,14 @@ switch ($Command) {
         while (-not (Test-Health $port) -and ((Get-Date) - $t).TotalSeconds -lt 120) { Start-Sleep 2 }
         if (-not (Test-Health $port)) { 'did not come up in 120 s - see logs\server-*.log'; return }
         "ready in {0:N0} s" -f ((Get-Date) - $t).TotalSeconds
+        # one tiny request now, so the expert cache is set up (about 4 s, on the first passes) before the first real one
+        $h = if ($Local) { @{} } else { @{ Authorization = 'Bearer ' + (Get-Content (Join-Path $root 'api-key.txt')).Trim() } }
+        $warm = '{"messages":[{"role":"user","content":"hi"}],"max_tokens":2,"temperature":0}'
+        try {
+            Invoke-RestMethod -Uri "http://127.0.0.1:$port/v1/chat/completions" -Method Post -ContentType 'application/json' -Headers $h `
+                -Body $warm -TimeoutSec 300 | Out-Null
+            'warmed up (expert cache ready)'
+        } catch { 'warm-up request failed: ' + $_.Exception.Message }
         if ($Local) { 'open http://127.0.0.1:8091 on this PC' }
         else {
             # this PC's addresses (LAN, and the VPN adapter if any)

@@ -34,15 +34,19 @@ param(
                                    # GPU stays in P2 during decode (0 = off; 2026-10-05: 3 questions 114 -> 88 s, GPU +35-45 W while generating)
     [double]$MaxWsGB = 9,          # hard working-set cap (0 = none): mapped pages above it go to the standby list.
                                    # 10 GB was 2% faster but left 1.5-2.8 GB of Available RAM (9 GB: 4.3 GB)
-    [double]$CacheGB = 7,          # expert cache: decode reads experts from this much locked memory, filled by unbuffered reads of
+    [double]$CacheGB = 8.5,        # expert cache: decode reads experts from this much locked memory, filled by unbuffered reads of
                                    # -CacheFile (tools\densecopy.exe) instead of the mapped GGUF (0 = off). The cache then sets the
                                    # working set itself: cache + -CacheMmapGB (hard cap), so -MaxWsGB only applies until then.
                                    # 2026-10-05: 10-question check 1099 -> 847 s, same answers, Available RAM >= 3.9 GB
     [string]$CacheFile = 'C:\models\Qwen3.8-Flash-Next\UD-Q4_K_XL\experts-dense',
-    [double]$CacheMmapGB = 2,
+    [double]$CacheMmapGB = 0.6,    # working set left for the mapped file in decode (n-gram rows etc.); see -PrefillReleaseGB
+    [double]$PrefillReleaseGB = 3.5, # cache given to the mapped side while a GPU prompt batch runs (taken back for decode;
+                                   # 2026-10-06, 3551 tokens: 0 -> 49.5 t/s, 2.5 -> 64.6, 3.5 -> 65.5)
     [int]$Predict = 8,             # next-layer prediction: -1 off, 0 statistics only, k > 0 read ahead the k best predicted experts
                                    # (2026-10-05: 8 with 2 workers 70.2 -> 67.4 s on 3 questions, same answers; 12/16 read too much)
     [int]$PredictWorkers = 2,      # read-ahead jobs use at most this many of the I/O workers
+    [int]$OffloadMinBatch = 1280,  # prompt batches of this many tokens go to the GPU (all experts of a layer copied over), smaller
+                                   # ones to the CPU through the expert cache (GGML_OP_OFFLOAD_MIN_BATCH)
     [switch]$SoftWs,               # soft cap instead: the working set grows until Available RAM is ~80 MB (the watchdog kills it)
     [switch]$Think,                # thinking on (the template's default is xhigh); off by default
     [switch]$Lan,                  # listen on 0.0.0.0:8090 with the API key in api-key.txt (LAN + Tailscale; firewall: fw-qwen.ps1)
@@ -75,6 +79,8 @@ if (-not $NoPrefetch) {
     $env:LLAMA_EXPERT_PREDICT = $(if ($Predict -ge 0) { '1' } else { '0' })
     $env:LLAMA_EXPERT_PREDICT_K = "$([Math]::Max(0, $Predict))"
     $env:LLAMA_EXPERT_PREDICT_WORKERS = "$PredictWorkers"
+    $env:GGML_OP_OFFLOAD_MIN_BATCH = "$OffloadMinBatch"
+    $env:LLAMA_EXPERT_CACHE_RELEASE_GB = "$PrefillReleaseGB"
 }
 $model = 'C:\models\Qwen3.8-Flash-Next\UD-Q4_K_XL\Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf'
 $logDir = Join-Path $root 'logs'
