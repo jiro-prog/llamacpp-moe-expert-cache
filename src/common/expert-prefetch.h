@@ -16,7 +16,8 @@
 //   LLAMA_EXPERT_PREFETCH_TOUCH    1 = touch the pages after prefetching them (default 1)
 //   LLAMA_EXPERT_PREFETCH_EVICT    drop slices of layers this many layers back from the working set (0 = off, default 2)
 //   LLAMA_EXPERT_PREFETCH_STATS    1 = print a line per pass (default 0)
-//   LLAMA_EXPERT_PREFETCH_TIMING   1 = also catch "ffn_moe_out-N" and split each pass into CPU-MoE / fetch / GPU time
+//   LLAMA_EXPERT_PREFETCH_TIMING   1 = also catch the MoE end ("ffn_moe_down-N", the last CPU node; LLAMA_EXPERT_PREFETCH_END_OUT=1:
+//                                  the GPU node "ffn_moe_out-N", one more GPU sync per layer) and split each pass into CPU-MoE / fetch / GPU time
 //                                  (adds one callback per layer; default 0)
 //   LLAMA_EXPERT_PREFETCH_DIAG     1 = also a "diag" line per pass: pages already in the working set, disk reads,
 //                                  page faults, per-page fault-in cost, CPU times (slows the fetch a little; default 0)

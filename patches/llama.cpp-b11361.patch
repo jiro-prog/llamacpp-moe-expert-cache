@@ -40,10 +40,10 @@ index aca1949..713573e 100644
      cparams.op_offload        = !params.no_op_offload;
 diff --git a/common/expert-prefetch.cpp b/common/expert-prefetch.cpp
 new file mode 100644
-index 0000000..5c18b76
+index 0000000..e2fcc18
 --- /dev/null
 +++ b/common/expert-prefetch.cpp
-@@ -0,0 +1,1408 @@
+@@ -0,0 +1,1564 @@
 +#include "expert-prefetch.h"
 +
 +#include "ggml.h"
@@ -132,6 +132,11 @@ index 0000000..5c18b76
 +    bool                    failed = false;
 +    double                  gb = 0;
 +    double                  mmap_gb = 2;
++    double                  release_gb = 0;   // LLAMA_EXPERT_CACHE_RELEASE_GB: given to the mapped side during GPU batches
++    bool                    released = false;
++    std::vector<std::vector<int32_t>> rel;   // per class: the slots given back
++    int64_t                 total_bytes = 0;
++    size_t                  ws_min_full = 0, ws_max = 0;
 +    bool                    reorder = true;   // LLAMA_EXPERT_CACHE_REORDER: MUL_MAT_ID does the cached experts first
 +    std::string             prefix;
 +    int                     n_expert = 0;
@@ -142,6 +147,8 @@ index 0000000..5c18b76
 +    std::unordered_map<const ggml_tensor *, int> tkey;   // weight -> layer*3 + kind
 +    std::vector<uint8_t>    spec;    // per unit: read ahead on a prediction and not used yet
 +    int                     max_unique = 0;   // larger batches use the mapped file (prefetch path)
++    int                     max_rows   = 32;  // batches of this many rows go to the GPU (GGML_OP_OFFLOAD_MIN_BATCH, the CUDA
++                                              // backend reads the same variable): the cache serves smaller ones
 +    // statistics, per pass
 +    std::atomic<int64_t>    n_hit{0}, n_miss{0}, n_wait{0}, ns_wait{0}, n_read{0}, bytes_read{0}, ns_read{0}, n_fail{0};
 +};
@@ -352,7 +359,13 @@ index 0000000..5c18b76
 +}
 +
 +bool parse_topk(const char * name, int & il)    { return parse_named(name, "ffn_moe_topk-", il) && il < MAX_LAYERS; }
-+bool parse_moe_out(const char * name, int & il) { return parse_named(name, "ffn_moe_out-", il) && il < MAX_LAYERS; }
++// the end of a layer's MoE as observed: the last CPU node, "ffn_moe_down-N" (no GPU sync), or with
++// LLAMA_EXPERT_PREFETCH_END_OUT=1 the GPU node "ffn_moe_out-N" (observing a GPU node makes the scheduler synchronize
++// there: one more GPU round trip per layer)
++bool g_end_at_out = false;
++bool parse_moe_out(const char * name, int & il) {
++    return parse_named(name, g_end_at_out ? "ffn_moe_out-" : "ffn_moe_down-", il) && il < MAX_LAYERS;
++}
 +
 +// "blk.17.ffn_down_exps.weight" -> layer 17, slot 2
 +bool parse_weight(const char * name, int & il, int & slot) {
@@ -597,7 +610,7 @@ index 0000000..5c18b76
 +            s->ka_cv.wait(lock, [s] { return s->ka_window.load() != 0; });
 +        }
 +        // one kernel at a time: the GPU work after the window waits for at most one spin. A window that is never
-+        // closed (a graph without "ffn_moe_out-N") ends after 2 s, so an idle server does not keep the GPU busy.
++        // closed (a graph without the MoE end node) ends after 2 s, so an idle server does not keep the GPU busy.
 +        const int64_t t_open = now_ns();
 +        while (s->ka_window.load()) {
 +            if (now_ns() - t_open > 2000000000LL) {
@@ -733,6 +746,9 @@ index 0000000..5c18b76
 +    // mapped part's share (prompts, the n-gram embedding rows, everything else)
 +    const SIZE_T ws_min = (SIZE_T) (total + (256ll << 20));
 +    const SIZE_T ws_max = (SIZE_T) (total + (int64_t) (ec.mmap_gb * (double) (1ll << 30)));
++    ec.ws_min_full = ws_min;
++    ec.ws_max      = ws_max;
++    ec.total_bytes = total;
 +    if (!SetProcessWorkingSetSizeEx(GetCurrentProcess(), ws_min, ws_max, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_ENABLE)) {
 +        std::fprintf(stderr, "expert-cache: SetProcessWorkingSetSizeEx failed (%lu)\n", GetLastError());
 +    }
@@ -850,16 +866,99 @@ index 0000000..5c18b76
 +    return jobs;
 +}
 +
++// A big prompt batch runs on the GPU, which copies every expert of a layer from the mapped file: the larger the mapped
++// share of the working set, the faster (2026-10-06, 3551 tokens: 0.6 GB 49.5 t/s, 2 GB 66 t/s, 3 GB 68 t/s). So while
++// such batches run, the coldest release_gb of the cache is decommitted (the hard cap is on the total, so the mapped
++// side gets that room), and committed again at the next batch that uses the cache.
++void ec_release(state & s) {
++    ec_cache &    ec   = s.ec;
++    const int64_t t0   = now_ns();
++    const int64_t want = (int64_t) (ec.release_gb * (double) (1ll << 30));
++    int64_t       freed = 0;
++    ec.rel.assign(ec.cls.size(), {});
++    for (size_t ci = 0; ci < ec.cls.size(); ++ci) {
++        ec_class &    c     = ec.cls[ci];
++        const int64_t share = (int64_t) ((double) want * c.n_slots * c.slot_size / std::max<int64_t>(1, ec.total_bytes));
++        std::vector<int32_t> pick;
++        int64_t got = 0;
++        for (auto it = c.lru.rbegin(); it != c.lru.rend() && got + c.slot_size <= share; ++it) {
++            const int own  = c.owner[*it];
++            bool      busy = false;
++            for (int k = 0; own >= 0 && k < 3; ++k) {
++                busy = busy || ec.ready[(size_t) own * 3 + k].load() == 1;
++            }
++            if (!busy) {
++                pick.push_back(*it);
++                got += c.slot_size;
++            }
++        }
++        for (int32_t sl : pick) {
++            const int own = c.owner[sl];
++            if (own >= 0) {
++                ec.slot[own] = -1;
++                ec.spec[own] = 0;
++                for (int k = 0; k < 3; ++k) {
++                    ec.ready[(size_t) own * 3 + k].store(0);
++                }
++            }
++            c.owner[sl] = -1;
++            c.lru.erase(c.pos[sl]);
++            char * p = c.mem + (int64_t) sl * c.slot_size;
++            VirtualUnlock(p, (SIZE_T) c.slot_size);
++            VirtualFree(p, (SIZE_T) c.slot_size, MEM_DECOMMIT);
++            ec.rel[ci].push_back(sl);
++        }
++        freed += got;
++    }
++    SetProcessWorkingSetSizeEx(GetCurrentProcess(), ec.ws_min_full - (size_t) freed, ec.ws_max,
++                               QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_ENABLE);
++    ec.released = true;
++    plog("expert-cache: gave %.2f GB to the mapped side for a GPU batch (%.2f s)\n", freed / 1e9, (now_ns() - t0) / 1e9);
++}
++
++void ec_restore(state & s) {
++    ec_cache &    ec = s.ec;
++    const int64_t t0 = now_ns();
++    SetProcessWorkingSetSizeEx(GetCurrentProcess(), ec.ws_min_full, ec.ws_max,
++                               QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_ENABLE);
++    int64_t back = 0;
++    for (size_t ci = 0; ci < ec.rel.size(); ++ci) {
++        ec_class & c = ec.cls[ci];
++        for (int32_t sl : ec.rel[ci]) {
++            char * p = c.mem + (int64_t) sl * c.slot_size;
++            if (!VirtualAlloc(p, (SIZE_T) c.slot_size, MEM_COMMIT, PAGE_READWRITE)) {
++                plog("expert-cache: cannot commit a slot again (%lu), it stays out\n", GetLastError());
++                continue;
++            }
++            if (!VirtualLock(p, (SIZE_T) c.slot_size)) {
++                for (int64_t o = 0; o < c.slot_size; o += 4096) {
++                    p[o] = 0;
++                }
++            }
++            c.lru.push_back(sl);
++            c.pos[sl] = std::prev(c.lru.end());
++            back += c.slot_size;
++        }
++    }
++    ec.rel.clear();
++    ec.released = false;
++    plog("expert-cache: took %.2f GB back (%.2f s)\n", back / 1e9, (now_ns() - t0) / 1e9);
++}
++
 +// the cache path of a layer's routing result: hits move to the hot end of the LRU, misses take the least recently used
 +// slots and are read. Read-ahead jobs of this layer still queued are moved in front if needed, dropped if not.
-+// false = the batch selects too many experts (prompt): the mapped file then
-+bool ec_route(state & s, int il, const std::vector<int32_t> & uniq, int64_t t_push) {
++// Short prompts (2-31 rows; 32+ go to the GPU) also come here: their misses go to the cold end, taken from slots of
++// other layers, so the next layer's prompt misses replace them first and the decode working set mostly survives
++// (2026-10-06: the mapped path read a 16-28 token prompt at 2-4 tok/s).
++// false = not for the cache (too many experts for the class, or a GPU batch): the mapped file then
++bool ec_route(state & s, int il, const std::vector<int32_t> & uniq, int64_t t_push, int64_t rows) {
 +    ec_cache & ec = s.ec;
-+    if ((int) uniq.size() > ec.max_unique) {
-+        return false;
-+    }
 +    const ec_layer & li = ec.L[il];
 +    ec_class &       c  = ec.cls[li.cls];
++    const bool batch = rows > 1;
++    if (batch ? (rows >= ec.max_rows || (int) uniq.size() > c.n_slots * 3 / 4) : (int) uniq.size() > ec.max_unique) {
++        return false;
++    }
 +    std::vector<job> promoted;
 +    {
 +        std::lock_guard<std::mutex> lock(s.mu);
@@ -926,12 +1025,55 @@ index 0000000..5c18b76
 +    }
 +    promoted.insert(promoted.end(), repair.begin(), repair.end());
 +    std::vector<int32_t> loaded;
-+    for (int32_t e : miss) {
-+        if (ec_take_slot(ec, c, (int64_t) il * ec.n_expert + e, false) < 0) {
-+            break;   // the rest come from the mapped file
++    if (batch) {
++        // the coldest slots that hold no unit of this layer and no read in flight, all taken at once and moved to the
++        // cold end together (taking them one by one would walk over this layer's new units again and again)
++        std::vector<int32_t> victims;
++        for (auto it = c.lru.rbegin(); it != c.lru.rend() && victims.size() < miss.size(); ++it) {
++            const int own = c.owner[*it];
++            if (own >= 0) {
++                if (own / ec.n_expert == il) {
++                    continue;
++                }
++                bool busy = false;
++                for (int k = 0; k < 3; ++k) {
++                    busy = busy || ec.ready[(size_t) own * 3 + k].load() == 1;
++                }
++                if (busy) {
++                    continue;
++                }
++            }
++            victims.push_back(*it);
 +        }
-+        ec.n_miss++;
-+        loaded.push_back(e);
++        for (size_t i = 0; i < victims.size(); ++i) {
++            const int     sl  = victims[i];
++            const int64_t u   = (int64_t) il * ec.n_expert + miss[i];
++            const int     own = c.owner[sl];
++            if (own >= 0) {
++                ec.slot[own] = -1;
++                ec.spec[own] = 0;
++                for (int k = 0; k < 3; ++k) {
++                    ec.ready[(size_t) own * 3 + k].store(0);
++                }
++            }
++            c.owner[sl] = (int32_t) u;
++            ec.slot[u]  = sl;
++            c.lru.splice(c.lru.end(), c.lru, c.pos[sl]);
++            for (int k = 0; k < 3; ++k) {
++                ec.ready[(size_t) u * 3 + k].store(1);
++            }
++            ec.n_miss++;
++            loaded.push_back(miss[i]);
++        }
++        // misses beyond the victims found come from the mapped file
++    } else {
++        for (int32_t e : miss) {
++            if (ec_take_slot(ec, c, (int64_t) il * ec.n_expert + e, false) < 0) {
++                break;   // the rest come from the mapped file
++            }
++            ec.n_miss++;
++            loaded.push_back(e);
++        }
 +    }
 +    std::vector<job> jobs = ec_jobs(ec, il, loaded, il, t_push);
 +    s.t_done[il]  = jobs.empty() ? now_ns() : 0;
@@ -993,7 +1135,7 @@ index 0000000..5c18b76
 +    s.diag      = env_int("LLAMA_EXPERT_PREFETCH_DIAG", 0) != 0;
 +    s.ka_spin_us = std::max(0, env_int("LLAMA_GPU_KEEPALIVE", 0));
 +    if (s.ka_spin_us > 0) {
-+        s.timing = true;   // the window ends at "ffn_moe_out-N"
++        s.timing = true;   // the window ends at the MoE end node ("ffn_moe_down-N")
 +    }
 +    if (const char * g = std::getenv("LLAMA_EXPERT_CACHE_GB")) {
 +        s.ec.gb = std::atof(g);
@@ -1009,7 +1151,12 @@ index 0000000..5c18b76
 +    s.pred_k  = std::max(0, env_int("LLAMA_EXPERT_PREDICT_K", 0));
 +    s.mid_max = std::max(1, env_int("LLAMA_EXPERT_PREDICT_WORKERS", 3));
 +    s.out_time = env_int("LLAMA_EXPERT_PREFETCH_OUTTIME", 0) != 0;
++    g_end_at_out = env_int("LLAMA_EXPERT_PREFETCH_END_OUT", 0) != 0;
 +    s.ec.reorder = env_int("LLAMA_EXPERT_CACHE_REORDER", 1) != 0;
++    s.ec.max_rows = std::max(2, env_int("GGML_OP_OFFLOAD_MIN_BATCH", 32));
++    if (const char * g = std::getenv("LLAMA_EXPERT_CACHE_RELEASE_GB")) {
++        s.ec.release_gb = std::max(0.0, std::atof(g));
++    }
 +    if (s.diag) {
 +        s.stats = true;
 +#ifdef _WIN32
@@ -1281,7 +1428,16 @@ index 0000000..5c18b76
 +        pred_score(s, il, uniq);
 +    }
 +    if (s.ec.on) {
-+        cached = ec_route(s, il, uniq, t_push);
++        // decided at layer 0 only: the last layer of a big batch keeps just the rows that produce output (often 1)
++        if (il == 0 && rows >= s.ec.max_rows) {
++            if (s.ec.release_gb > 0 && !s.ec.released) {
++                ec_release(s);   // a GPU batch: more room for the mapped side
++            }
++        } else if (il == 0 && s.ec.released) {
++            ec_restore(s);
++        }
++        cached = ec_route(s, il, uniq, t_push, rows);
++
 +    }
 +#endif
 +    if (!cached) {
@@ -1454,10 +1610,10 @@ index 0000000..5c18b76
 +}
 diff --git a/common/expert-prefetch.h b/common/expert-prefetch.h
 new file mode 100644
-index 0000000..2b79cd9
+index 0000000..cc1c885
 --- /dev/null
 +++ b/common/expert-prefetch.h
-@@ -0,0 +1,34 @@
+@@ -0,0 +1,35 @@
 +#pragma once
 +
 +// Expert prefetch for MoE models whose routed experts stay memory-mapped on the CPU side (-ot exps=CPU).
@@ -1476,7 +1632,8 @@ index 0000000..2b79cd9
 +//   LLAMA_EXPERT_PREFETCH_TOUCH    1 = touch the pages after prefetching them (default 1)
 +//   LLAMA_EXPERT_PREFETCH_EVICT    drop slices of layers this many layers back from the working set (0 = off, default 2)
 +//   LLAMA_EXPERT_PREFETCH_STATS    1 = print a line per pass (default 0)
-+//   LLAMA_EXPERT_PREFETCH_TIMING   1 = also catch "ffn_moe_out-N" and split each pass into CPU-MoE / fetch / GPU time
++//   LLAMA_EXPERT_PREFETCH_TIMING   1 = also catch the MoE end ("ffn_moe_down-N", the last CPU node; LLAMA_EXPERT_PREFETCH_END_OUT=1:
++//                                  the GPU node "ffn_moe_out-N", one more GPU sync per layer) and split each pass into CPU-MoE / fetch / GPU time
 +//                                  (adds one callback per layer; default 0)
 +//   LLAMA_EXPERT_PREFETCH_DIAG     1 = also a "diag" line per pass: pages already in the working set, disk reads,
 +//                                  page faults, per-page fault-in cost, CPU times (slows the fetch a little; default 0)
