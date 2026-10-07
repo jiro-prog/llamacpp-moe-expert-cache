@@ -228,7 +228,11 @@ std::mutex       g_log_mu;
 std::string      g_log_buf;
 std::once_flag   g_log_once;
 
+// when the GPU keep-alive kernel in flight was launched (0 = none); the log writer reports one that does not finish
+std::atomic<int64_t> g_ka_launch_ns{0};
+
 void log_writer() {
+    int64_t reported = 0;
     for (;;) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
         std::string b;
@@ -239,6 +243,13 @@ void log_writer() {
         if (!b.empty()) {
             std::fwrite(b.data(), 1, b.size(), stderr);
             std::fflush(stderr);
+        }
+        const int64_t t = g_ka_launch_ns.load();
+        if (t && t != reported && now_ns() - t > 3000000000LL) {
+            std::fprintf(stderr, "gpu-keepalive: a keep-alive kernel has not finished for %.0f s - the GPU looks stuck\n",
+                         (now_ns() - t) / 1e9);
+            std::fflush(stderr);
+            reported = t;
         }
     }
 }
@@ -496,20 +507,23 @@ void worker(state * s) {
 }
 
 #ifdef _WIN32
-// a kernel that spins on %globaltimer for the given number of ns (one warp)
+// a kernel that spins one warp for the given number of SM clock cycles (%clock64: per SM, counts up while the SM runs).
+// It used %globaltimer before: on 2026-10-06/07 the server hung for 18 hours at the first decode token after a day of
+// idling, the keep-alive kernel never finishing and the model's work queued behind it (WDDM) - a timer that does not
+// reach the target keeps such a loop going. A cycle count always ends.
 const char * KA_PTX =
     ".version 7.0\n"
     ".target sm_52\n"
     ".address_size 64\n"
-    ".visible .entry spin(.param .u64 ns)\n"
+    ".visible .entry spin(.param .u64 cycles)\n"
     "{\n"
     "  .reg .u64 %rd<5>;\n"
     "  .reg .pred %p;\n"
-    "  ld.param.u64 %rd1, [ns];\n"
-    "  mov.u64 %rd2, %globaltimer;\n"
+    "  ld.param.u64 %rd1, [cycles];\n"
+    "  mov.u64 %rd2, %clock64;\n"
     "  add.u64 %rd3, %rd2, %rd1;\n"
     "L:\n"
-    "  mov.u64 %rd4, %globaltimer;\n"
+    "  mov.u64 %rd4, %clock64;\n"
     "  setp.lt.u64 %p, %rd4, %rd3;\n"
     "  @%p bra L;\n"
     "  ret;\n"
@@ -556,8 +570,10 @@ void keepalive_thread(state * s) {
         return;
     }
     std::fprintf(stderr, "gpu-keepalive: on (%d us spins while the CPU computes the experts, stream priority %d)\n", s->ka_spin_us, lo);
-    uint64_t ns     = (uint64_t) s->ka_spin_us * 1000;
-    void *   args[] = { &ns };
+    // cycles for spin_us at the boost clock (1.9 GHz on the RTX 3060 Ti; a slower clock only makes the spin longer, and
+    // the keep-alive is what keeps the clock up)
+    uint64_t cycles = (uint64_t) s->ka_spin_us * 1900;
+    void *   args[] = { &cycles };
     for (;;) {
         {
             std::unique_lock<std::mutex> lock(s->ka_mu);
@@ -571,11 +587,14 @@ void keepalive_thread(state * s) {
                 s->ka_window = 0;
                 break;
             }
+            g_ka_launch_ns = now_ns();
             if ((r = cuLaunchKernel(fn, 1, 1, 1, 32, 1, 1, 0, st, args, nullptr)) || (r = cuEventRecord(ev[0], st))) {
+                g_ka_launch_ns = 0;
                 std::fprintf(stderr, "gpu-keepalive: CUDA driver error %d, stopping\n", r);
                 return;
             }
             cuEventSynchronize(ev[0]);
+            g_ka_launch_ns = 0;
             s->ka_kernels++;
         }
     }
@@ -1101,6 +1120,7 @@ void start(state & s) {
         s.ec.prefix = p;
     }
     s.ec.on = false;   // set by ec_init on the first pass that knows every layer
+    std::call_once(g_log_once, [] { std::thread(log_writer).detach(); });   // also watches the GPU keep-alive
     s.pred_on = env_int("LLAMA_EXPERT_PREDICT", 0) > 0;
     s.pred_k  = std::max(0, env_int("LLAMA_EXPERT_PREDICT_K", 0));
     s.mid_max = std::max(1, env_int("LLAMA_EXPERT_PREDICT_WORKERS", 3));
